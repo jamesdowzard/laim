@@ -374,11 +374,11 @@ class ExecutionContext:
         """Create an execution context on the cluster."""
         self._log(f"Creating {self.language} execution context...")
 
-        # Using API 2.0 for context creation
+        # Using API 1.2 for context creation (2.0 endpoint doesn't exist)
         result = api_request(
             self.config,
             "POST",
-            "/api/2.0/contexts/create",
+            "/api/1.2/contexts/create",
             data={"language": self.language, "clusterId": self.config.cluster_id},
         )
 
@@ -399,7 +399,7 @@ class ExecutionContext:
             api_request(
                 self.config,
                 "POST",
-                "/api/2.0/contexts/destroy",
+                "/api/1.2/contexts/destroy",
                 data={"contextId": self.context_id, "clusterId": self.config.cluster_id},
             )
             self._log("Context destroyed.")
@@ -419,7 +419,7 @@ class ExecutionContext:
         result = api_request(
             self.config,
             "POST",
-            "/api/2.0/commands/execute",
+            "/api/1.2/commands/execute",
             data={
                 "language": self.language,
                 "contextId": self.context_id,
@@ -440,7 +440,7 @@ class ExecutionContext:
             status_result = api_request(
                 self.config,
                 "GET",
-                "/api/2.0/commands/status",
+                "/api/1.2/commands/status",
                 params={
                     "clusterId": self.config.cluster_id,
                     "contextId": self.context_id,
@@ -468,7 +468,7 @@ class ExecutionContext:
         api_request(
             self.config,
             "POST",
-            "/api/2.0/commands/cancel",
+            "/api/1.2/commands/cancel",
             data={
                 "clusterId": self.config.cluster_id,
                 "contextId": self.context_id,
