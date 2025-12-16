@@ -39,6 +39,7 @@ import argparse
 import configparser
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -109,6 +110,27 @@ class DatabricksConfig:
             self.cluster_id = section.get("cluster_id", "").strip()
         if not self.warehouse_id:
             self.warehouse_id = section.get("warehouse_id", "").strip()
+
+        # Handle databricks-cli auth type (OAuth via CLI)
+        auth_type = section.get("auth_type", "").strip()
+        if not self.token and auth_type == "databricks-cli":
+            self.token = self._get_token_from_cli()
+
+    def _get_token_from_cli(self) -> Optional[str]:
+        """Get access token from Databricks CLI for databricks-cli auth type."""
+        try:
+            result = subprocess.run(
+                ["databricks", "auth", "token", "--profile", self.profile],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                token_data = json.loads(result.stdout)
+                return token_data.get("access_token")
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+            pass
+        return None
 
     def validate_for_sql_warehouse(self) -> None:
         """Validate configuration for SQL Warehouse execution."""
