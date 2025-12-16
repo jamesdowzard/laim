@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Databricks Execution Context - Execute arbitrary code on Databricks clusters.
+Databricks Code Executor - Execute code on Databricks clusters or SQL Warehouses.
 
-A fully templated, configurable script for executing Python, SQL, or Scala code
-on Databricks clusters via the Execution Context API (1.2).
+Supports multiple execution backends:
+1. SQL Statement API (2.0) - For SQL on serverless SQL Warehouses (fast, no cluster needed)
+2. Execution Context API (2.0) - For Python/SQL/Scala/R on clusters
 
 Configuration can be provided via:
 1. CLI arguments (highest priority)
@@ -11,29 +12,27 @@ Configuration can be provided via:
 3. ~/.databrickscfg profile (lowest priority)
 
 Usage:
-    # Execute Python command using default profile
-    python databricks_exec.py -c "print(spark.version)"
+    # Execute SQL on serverless SQL Warehouse (recommended for SQL)
+    python databricks_exec.py --warehouse-id "abc123" --language sql -c "SELECT * FROM table"
 
-    # Execute SQL query
-    python databricks_exec.py --language sql -c "SHOW DATABASES"
+    # Execute Python on cluster
+    python databricks_exec.py --cluster-id "xyz789" -c "print(spark.version)"
 
-    # Execute a file
-    python databricks_exec.py -f script.py
+    # Execute SQL on cluster (if no warehouse specified)
+    python databricks_exec.py --cluster-id "xyz789" --language sql -c "SHOW DATABASES"
 
-    # Use specific profile and cluster
-    python databricks_exec.py --profile PROD --cluster-id "abc-123-xyz" -c "spark.sql('SELECT 1').show()"
+    # Use profile from ~/.databrickscfg
+    python databricks_exec.py --profile exploration --language sql -c "SHOW TABLES"
 
-    # Use environment variables for auth
-    DATABRICKS_HOST=https://adb-xxx.azuredatabricks.net DATABRICKS_TOKEN=xxx python databricks_exec.py -c "print(1)"
-
-    # Interactive REPL mode
-    python databricks_exec.py --repl
+    # Interactive REPL mode (cluster only)
+    python databricks_exec.py --cluster-id "xyz789" --repl
 
 Environment Variables:
-    DATABRICKS_HOST       - Databricks workspace URL
-    DATABRICKS_TOKEN      - Personal access token or OAuth token
-    DATABRICKS_CLUSTER_ID - Default cluster ID
-    DATABRICKS_PROFILE    - Profile name in ~/.databrickscfg
+    DATABRICKS_HOST         - Databricks workspace URL
+    DATABRICKS_TOKEN        - Personal access token or OAuth token
+    DATABRICKS_CLUSTER_ID   - Default cluster ID
+    DATABRICKS_WAREHOUSE_ID - Default SQL Warehouse ID
+    DATABRICKS_PROFILE      - Profile name in ~/.databrickscfg
 """
 
 import argparse
@@ -43,7 +42,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import urllib.request
 import urllib.error
 
@@ -56,11 +55,13 @@ class DatabricksConfig:
         host: Optional[str] = None,
         token: Optional[str] = None,
         cluster_id: Optional[str] = None,
+        warehouse_id: Optional[str] = None,
         profile: Optional[str] = None,
     ):
         self.host = host
         self.token = token
         self.cluster_id = cluster_id
+        self.warehouse_id = warehouse_id
         self.profile = profile or os.environ.get("DATABRICKS_PROFILE", "DEFAULT")
 
         self._resolve_config()
@@ -74,6 +75,8 @@ class DatabricksConfig:
             self.token = os.environ.get("DATABRICKS_TOKEN")
         if not self.cluster_id:
             self.cluster_id = os.environ.get("DATABRICKS_CLUSTER_ID")
+        if not self.warehouse_id:
+            self.warehouse_id = os.environ.get("DATABRICKS_WAREHOUSE_ID")
 
         # Fall back to config file
         if not self.host or not self.token:
@@ -104,9 +107,27 @@ class DatabricksConfig:
             self.token = section.get("token", "").strip()
         if not self.cluster_id:
             self.cluster_id = section.get("cluster_id", "").strip()
+        if not self.warehouse_id:
+            self.warehouse_id = section.get("warehouse_id", "").strip()
 
-    def validate(self) -> None:
-        """Validate that required configuration is present."""
+    def validate_for_sql_warehouse(self) -> None:
+        """Validate configuration for SQL Warehouse execution."""
+        missing = []
+        if not self.host:
+            missing.append("host (DATABRICKS_HOST or --host)")
+        if not self.token:
+            missing.append("token (DATABRICKS_TOKEN or --token)")
+        if not self.warehouse_id:
+            missing.append("warehouse_id (DATABRICKS_WAREHOUSE_ID or --warehouse-id)")
+
+        if missing:
+            raise ValueError(
+                f"Missing required configuration: {', '.join(missing)}\n"
+                "Provide via CLI arguments, environment variables, or ~/.databrickscfg"
+            )
+
+    def validate_for_cluster(self) -> None:
+        """Validate configuration for cluster execution."""
         missing = []
         if not self.host:
             missing.append("host (DATABRICKS_HOST or --host)")
@@ -128,7 +149,7 @@ def api_request(
     endpoint: str,
     data: Optional[Dict[str, Any]] = None,
     params: Optional[Dict[str, Any]] = None,
-    timeout: int = 60,
+    timeout: int = 120,
 ) -> Dict[str, Any]:
     """Make a request to the Databricks REST API."""
     url = f"{config.host.rstrip('/')}{endpoint}"
@@ -156,8 +177,140 @@ def api_request(
         raise RuntimeError(f"Connection Error: {e.reason}") from e
 
 
+class SQLStatementExecutor:
+    """Execute SQL on Databricks SQL Warehouses via SQL Statement Execution API 2.0.
+
+    This is the recommended approach for SQL queries as it:
+    - Works with serverless SQL Warehouses (no cluster needed)
+    - Has lower latency than cluster-based execution
+    - Supports larger result sets with chunking
+    """
+
+    def __init__(
+        self,
+        config: DatabricksConfig,
+        poll_interval: float = 1.0,
+        verbose: bool = False,
+        row_limit: int = 10000,
+    ):
+        self.config = config
+        self.poll_interval = poll_interval
+        self.verbose = verbose
+        self.row_limit = row_limit
+
+    def _log(self, message: str) -> None:
+        """Print message if verbose mode is enabled."""
+        if self.verbose:
+            print(f"[DEBUG] {message}", file=sys.stderr)
+
+    def execute(self, statement: str) -> Dict[str, Any]:
+        """Execute a SQL statement and return results."""
+        self._log(f"Submitting SQL statement ({len(statement)} chars)...")
+
+        # Submit statement
+        result = api_request(
+            self.config,
+            "POST",
+            "/api/2.0/sql/statements",
+            data={
+                "warehouse_id": self.config.warehouse_id,
+                "statement": statement,
+                "wait_timeout": "50s",  # Wait up to 50s for inline results
+                "disposition": "INLINE",
+                "format": "JSON_ARRAY",
+                "row_limit": self.row_limit,
+            },
+        )
+
+        statement_id = result.get("statement_id")
+        status = result.get("status", {})
+        state = status.get("state", "")
+
+        self._log(f"Statement submitted: {statement_id}, state: {state}")
+
+        # If still running, poll for completion
+        poll_count = 0
+        while state in ("PENDING", "RUNNING"):
+            poll_count += 1
+            if poll_count % 10 == 0:
+                self._log(f"Still running... (poll #{poll_count})")
+
+            time.sleep(self.poll_interval)
+
+            result = api_request(
+                self.config,
+                "GET",
+                f"/api/2.0/sql/statements/{statement_id}",
+            )
+            status = result.get("status", {})
+            state = status.get("state", "")
+
+        self._log(f"Statement completed with state: {state}")
+
+        return result
+
+    def format_result(self, result: Dict[str, Any], output_format: str = "text") -> str:
+        """Format SQL statement result for display."""
+        status = result.get("status", {})
+        state = status.get("state", "")
+
+        if state == "FAILED":
+            error = status.get("error", {})
+            message = error.get("message", "Unknown error")
+            return f"ERROR: {message}"
+
+        if state == "CANCELED":
+            return "Statement was canceled"
+
+        if state == "CLOSED":
+            return "Statement was closed"
+
+        # Get result data
+        manifest = result.get("manifest", {})
+        schema = manifest.get("schema", {})
+        columns = schema.get("columns", [])
+        total_rows = manifest.get("total_row_count", 0)
+
+        result_data = result.get("result", {})
+        data_array = result_data.get("data_array", [])
+
+        if not columns:
+            return "(No results)"
+
+        # Extract column names
+        headers = [col.get("name", f"col{i}") for i, col in enumerate(columns)]
+
+        if output_format == "json":
+            # Convert to list of dicts
+            rows = []
+            for row in data_array:
+                rows.append(dict(zip(headers, row)))
+            return json.dumps({"columns": headers, "data": rows, "total_rows": total_rows}, indent=2)
+
+        elif output_format == "csv":
+            lines = [",".join(headers)]
+            for row in data_array:
+                lines.append(",".join(str(v) if v is not None else "" for v in row))
+            return "\n".join(lines)
+
+        else:  # text/tabular
+            output_parts = []
+            output_parts.append("\t".join(headers))
+            output_parts.append("-" * 60)
+            for row in data_array[:100]:
+                output_parts.append("\t".join(str(v) if v is not None else "NULL" for v in row))
+            if len(data_array) > 100:
+                output_parts.append(f"... ({len(data_array) - 100} more rows)")
+            if total_rows > len(data_array):
+                output_parts.append(f"[Truncated: showing {len(data_array)} of {total_rows} total rows]")
+            return "\n".join(output_parts) if output_parts else "(No output)"
+
+
 class ExecutionContext:
-    """Manages a Databricks execution context for running code on a cluster."""
+    """Manages a Databricks execution context for running code on a cluster.
+
+    Uses Command Execution API 2.0 for Python, SQL, Scala, and R execution.
+    """
 
     SUPPORTED_LANGUAGES = ("python", "sql", "scala", "r")
 
@@ -199,10 +352,11 @@ class ExecutionContext:
         """Create an execution context on the cluster."""
         self._log(f"Creating {self.language} execution context...")
 
+        # Using API 2.0 for context creation
         result = api_request(
             self.config,
             "POST",
-            "/api/1.2/contexts/create",
+            "/api/2.0/contexts/create",
             data={"language": self.language, "clusterId": self.config.cluster_id},
         )
 
@@ -223,7 +377,7 @@ class ExecutionContext:
             api_request(
                 self.config,
                 "POST",
-                "/api/1.2/contexts/destroy",
+                "/api/2.0/contexts/destroy",
                 data={"contextId": self.context_id, "clusterId": self.config.cluster_id},
             )
             self._log("Context destroyed.")
@@ -239,11 +393,11 @@ class ExecutionContext:
 
         self._log(f"Submitting command ({len(command)} chars)...")
 
-        # Submit command
+        # Submit command using API 2.0
         result = api_request(
             self.config,
             "POST",
-            "/api/1.2/commands/execute",
+            "/api/2.0/commands/execute",
             data={
                 "language": self.language,
                 "contextId": self.context_id,
@@ -264,7 +418,7 @@ class ExecutionContext:
             status_result = api_request(
                 self.config,
                 "GET",
-                "/api/1.2/commands/status",
+                "/api/2.0/commands/status",
                 params={
                     "clusterId": self.config.cluster_id,
                     "contextId": self.context_id,
@@ -292,7 +446,7 @@ class ExecutionContext:
         api_request(
             self.config,
             "POST",
-            "/api/1.2/commands/cancel",
+            "/api/2.0/commands/cancel",
             data={
                 "clusterId": self.config.cluster_id,
                 "contextId": self.context_id,
@@ -310,7 +464,7 @@ class ExecutionContext:
 
 
 class OutputFormatter:
-    """Format execution results for display."""
+    """Format execution context results for display."""
 
     @staticmethod
     def format(result: Dict[str, Any], output_format: str = "text") -> str:
@@ -368,8 +522,24 @@ class OutputFormatter:
         return "\n".join(output_parts) if output_parts else "(No output)"
 
 
+def run_sql_warehouse(
+    config: DatabricksConfig,
+    statement: str,
+    output_format: str = "text",
+    verbose: bool = False,
+) -> int:
+    """Execute SQL on a SQL Warehouse and return exit code."""
+    executor = SQLStatementExecutor(config, verbose=verbose)
+    result = executor.execute(statement)
+    output = executor.format_result(result, output_format)
+    print(output)
+
+    state = result.get("status", {}).get("state", "")
+    return 1 if state == "FAILED" else 0
+
+
 def run_command(ctx: ExecutionContext, command: str, output_format: str = "text") -> int:
-    """Execute a single command and return exit code."""
+    """Execute a single command on a cluster and return exit code."""
     with ctx:
         result = ctx.execute(command)
         output = OutputFormatter.format(result, output_format)
@@ -380,7 +550,7 @@ def run_command(ctx: ExecutionContext, command: str, output_format: str = "text"
 
 
 def run_file(ctx: ExecutionContext, file_path: str, output_format: str = "text") -> int:
-    """Execute a file and return exit code."""
+    """Execute a file on a cluster and return exit code."""
     path = Path(file_path)
 
     if not path.exists():
@@ -402,7 +572,7 @@ def run_file(ctx: ExecutionContext, file_path: str, output_format: str = "text")
 
 
 def run_repl(ctx: ExecutionContext) -> None:
-    """Run an interactive REPL session."""
+    """Run an interactive REPL session on a cluster."""
     print("\nDatabricks Execution Context REPL")
     print(f"Language: {ctx.language} | Cluster: {ctx.config.cluster_id}")
     print("Type 'exit' or 'quit' to end session. Multi-line: end with blank line.\n")
@@ -456,33 +626,39 @@ def run_repl(ctx: ExecutionContext) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Execute code on Databricks clusters via Execution Context API",
+        description="Execute code on Databricks clusters or SQL Warehouses",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Execute Python command
-  python databricks_exec.py -c "print(spark.version)"
+  # Execute SQL on serverless SQL Warehouse (fast, recommended for SQL)
+  python databricks_exec.py --warehouse-id "abc123" --language sql -c "SELECT * FROM table LIMIT 10"
 
-  # Execute SQL query
-  python databricks_exec.py --language sql -c "SHOW DATABASES"
+  # Execute SQL using profile with warehouse_id configured
+  python databricks_exec.py --profile exploration --language sql -c "SHOW DATABASES"
 
-  # Execute a file
-  python databricks_exec.py -f my_script.py
+  # Execute Python on cluster
+  python databricks_exec.py --cluster-id "xyz789" -c "print(spark.version)"
 
-  # Use specific profile
-  python databricks_exec.py --profile DEV -c "print(1)"
+  # Execute a file on cluster
+  python databricks_exec.py --cluster-id "xyz789" -f my_script.py
 
-  # Interactive REPL
-  python databricks_exec.py --repl
+  # Interactive REPL on cluster
+  python databricks_exec.py --cluster-id "xyz789" --repl
 
   # Check cluster state
-  python databricks_exec.py --check-cluster
+  python databricks_exec.py --cluster-id "xyz789" --check-cluster
 
 Environment Variables:
-  DATABRICKS_HOST       - Workspace URL (e.g., https://adb-xxx.azuredatabricks.net)
-  DATABRICKS_TOKEN      - Personal access token
-  DATABRICKS_CLUSTER_ID - Default cluster ID
-  DATABRICKS_PROFILE    - Profile name in ~/.databrickscfg
+  DATABRICKS_HOST         - Workspace URL (e.g., https://adb-xxx.azuredatabricks.net)
+  DATABRICKS_TOKEN        - Personal access token
+  DATABRICKS_CLUSTER_ID   - Default cluster ID (for Python/Scala/R)
+  DATABRICKS_WAREHOUSE_ID - Default SQL Warehouse ID (for SQL)
+  DATABRICKS_PROFILE      - Profile name in ~/.databrickscfg
+
+Execution Backend Selection:
+  - SQL + warehouse_id: Uses SQL Statement API 2.0 (serverless, fast)
+  - SQL + cluster_id (no warehouse): Uses Command Execution API 2.0 on cluster
+  - Python/Scala/R: Uses Command Execution API 2.0 on cluster (requires cluster_id)
         """,
     )
 
@@ -490,14 +666,15 @@ Environment Variables:
     conn_group = parser.add_argument_group("Connection")
     conn_group.add_argument("--host", help="Databricks workspace URL")
     conn_group.add_argument("--token", help="Personal access token")
-    conn_group.add_argument("--cluster-id", help="Cluster ID to execute on")
+    conn_group.add_argument("--cluster-id", help="Cluster ID for code execution")
+    conn_group.add_argument("--warehouse-id", help="SQL Warehouse ID for SQL execution (serverless)")
     conn_group.add_argument("--profile", help="Profile name in ~/.databrickscfg")
 
     # Execution arguments
     exec_group = parser.add_argument_group("Execution")
     exec_group.add_argument("-c", "--command", help="Command to execute")
     exec_group.add_argument("-f", "--file", help="File to execute")
-    exec_group.add_argument("--repl", action="store_true", help="Start interactive REPL")
+    exec_group.add_argument("--repl", action="store_true", help="Start interactive REPL (cluster only)")
     exec_group.add_argument(
         "--language",
         choices=ExecutionContext.SUPPORTED_LANGUAGES,
@@ -524,6 +701,12 @@ Environment Variables:
         default=0.5,
         help="Polling interval in seconds (default: 0.5)",
     )
+    util_group.add_argument(
+        "--row-limit",
+        type=int,
+        default=10000,
+        help="Maximum rows to return for SQL Warehouse queries (default: 10000)",
+    )
 
     args = parser.parse_args()
 
@@ -533,6 +716,7 @@ Environment Variables:
             host=args.host,
             token=args.token,
             cluster_id=args.cluster_id,
+            warehouse_id=args.warehouse_id,
             profile=args.profile,
         )
     except Exception as e:
@@ -542,7 +726,7 @@ Environment Variables:
     # Check cluster state if requested
     if args.check_cluster:
         try:
-            config.validate()
+            config.validate_for_cluster()
             ctx = ExecutionContext(config, verbose=args.verbose)
             state = ctx.check_cluster_state()
             print(f"Cluster state: {state}")
@@ -557,29 +741,68 @@ Environment Variables:
         print("\nError: Must specify -c/--command, -f/--file, or --repl", file=sys.stderr)
         return 1
 
-    # Validate configuration
-    try:
-        config.validate()
-    except ValueError as e:
-        print(f"Configuration error: {e}", file=sys.stderr)
-        return 1
-
-    # Create execution context
-    ctx = ExecutionContext(
-        config,
-        language=args.language,
-        poll_interval=args.poll_interval,
-        verbose=args.verbose,
+    # Determine execution backend
+    use_sql_warehouse = (
+        args.language == "sql"
+        and config.warehouse_id
+        and not args.repl  # REPL always uses cluster
+        and not args.file  # File execution uses cluster
     )
 
-    # Execute based on mode
-    if args.repl:
-        run_repl(ctx)
-        return 0
-    elif args.command:
-        return run_command(ctx, args.command, args.output_format)
-    elif args.file:
-        return run_file(ctx, args.file, args.output_format)
+    if use_sql_warehouse:
+        # SQL Statement API path (serverless)
+        try:
+            config.validate_for_sql_warehouse()
+        except ValueError as e:
+            print(f"Configuration error: {e}", file=sys.stderr)
+            return 1
+
+        if args.verbose:
+            print(f"[DEBUG] Using SQL Statement API with warehouse {config.warehouse_id}", file=sys.stderr)
+
+        return run_sql_warehouse(
+            config,
+            args.command,
+            args.output_format,
+            verbose=args.verbose,
+        )
+
+    else:
+        # Execution Context API path (cluster)
+        try:
+            config.validate_for_cluster()
+        except ValueError as e:
+            # Provide helpful hint about warehouse option for SQL
+            if args.language == "sql":
+                print(
+                    f"Configuration error: {e}\n\n"
+                    "Hint: For SQL queries, you can use --warehouse-id to run on a serverless SQL Warehouse "
+                    "without needing a cluster.",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"Configuration error: {e}", file=sys.stderr)
+            return 1
+
+        if args.verbose:
+            print(f"[DEBUG] Using Command Execution API with cluster {config.cluster_id}", file=sys.stderr)
+
+        # Create execution context
+        ctx = ExecutionContext(
+            config,
+            language=args.language,
+            poll_interval=args.poll_interval,
+            verbose=args.verbose,
+        )
+
+        # Execute based on mode
+        if args.repl:
+            run_repl(ctx)
+            return 0
+        elif args.command:
+            return run_command(ctx, args.command, args.output_format)
+        elif args.file:
+            return run_file(ctx, args.file, args.output_format)
 
     return 0
 
